@@ -39,7 +39,7 @@ type ShardKV struct {
 	persister	*raft.Persister
 	kvStore		map[int]*Shard		// gid -> map[key]value
 	clientRequestId map[int64]int64
-	waitChans	map[int]map[int]chan CommandRequest		// gid -> map[index]chan Op
+	waitChans	map[int]chan CommandRequest	
 
 	dead		int32
 	shardctClerk	*shardctrler.Clerk
@@ -47,8 +47,8 @@ type ShardKV struct {
 	lastConfig	shardctrler.Config		// 上一个config
 	lastApplied	int
 	gid2Leader	map[int]int
-	gcShard		map[int]int
-
+	gcShard		map[int]map[string]string
+	pullingShard	map[int]map[string]string
 }
 
 type Shard struct {
@@ -117,32 +117,19 @@ func (kv *ShardKV) checkShard(shard int) bool {
 	return kv.currentConfig.Shards[shard] == kv.gid
 }
 
-func (kv *ShardKV) getChan(shard int, index int) chan CommandRequest {
+func (kv *ShardKV) getChan(index int) chan CommandRequest {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	_, exists := kv.waitChans[shard]
+	_, exists := kv.waitChans[index]
 	if !exists {
-		kv.waitChans[shard] = make(map[int]chan CommandRequest)
+		kv.waitChans[index] = make(chan CommandRequest)
 	}
-	_, ex := kv.waitChans[shard][index]
-	if !ex {
-		kv.waitChans[shard][index] = make(chan CommandRequest)
-	}
-	return kv.waitChans[shard][index]
+	return kv.waitChans[index]
 }
 
-func (kv *ShardKV) chanExists(shard int, index int) bool {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	_, exists := kv.waitChans[shard]
-	if !exists {
-		return false
-	}
-	_, ex := kv.waitChans[shard][index]
-	if !ex {
-		return false
-	}
-	return true
+func (kv *ShardKV) chanExists(index int) bool {
+	_, exists := kv.waitChans[index]
+	return exists
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
@@ -184,12 +171,13 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	waitChan := kv.getChan(targetShard, index)
+	waitChan := kv.getChan(index)
 	defer func() {
 		kv.mu.Lock()
-		delete(kv.waitChans[targetShard], index)
+		delete(kv.waitChans, index)
 		kv.mu.Unlock()
 	}()
+	//log.Printf("receive Get %d %d", args.ClientId, args.RequestId)
 	timer := time.NewTicker(100 * time.Millisecond)
 
 	select {
@@ -238,6 +226,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		Op: Operation,
 		Data: CommandRequest {
 			Key: args.Key,
+			Value: args.Value,
 			Op: args.Op,
 			ClientId: args.ClientId,
 			RequestId: args.RequestId,
@@ -248,25 +237,26 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	waitChan := kv.getChan(targetShard, index)
+	waitChan := kv.getChan(index)
 	defer func() {
 		kv.mu.Lock()
-		delete(kv.waitChans[targetShard], index)
+		delete(kv.waitChans, index)
 		kv.mu.Unlock()
 	}()
-	timer := time.NewTicker(100 * time.Millisecond)
+	timer := time.NewTicker(150 * time.Millisecond)
 
 	select {
 	case ret := <-waitChan :
+		timer.Stop()
 		if ret.ClientId != args.ClientId || ret.RequestId != args.RequestId {
 			reply.Err = ErrWrongLeader
 		} else {
 			reply.Err = ret.Err
+			
 		}
-		log.Printf("target shard : %d current group : %d", targetShard, kv.gid)
-		timer.Stop()
+		//log.Printf("target shard : %d current group : %d", targetShard, kv.gid)
+		
 	case <-timer.C :
-		//log.Printf("timeout...")
 		reply.Err = ErrWrongLeader
 	}
 }
@@ -286,17 +276,14 @@ func (kv *ShardKV) applyLoop() {
 					shard := key2shard(op.Key)
 					if !kv.checkShard(shard) {
 						op.Err = ErrWrongGroup
-						if kv.chanExists(shard, msg.CommandIndex) {
-							kv.getChan(shard, msg.CommandIndex) <- op
+						if kv.chanExists(msg.CommandIndex) {
+							kv.getChan(msg.CommandIndex) <- op
 						}
 						continue
 					}
 					if kv.isDuplicate(shard, op.ClientId, op.RequestId) {
 						continue
 					}
-					kv.mu.Lock()
-					kv.clientRequestId[op.ClientId] = op.RequestId
-					kv.mu.Unlock()
 					if op.Op == "Get" {
 						go kv.getHandle(&op, msg.CommandIndex)
 					} else if op.Op == "Append" {
@@ -327,6 +314,7 @@ func (kv *ShardKV) applyLoop() {
 				kv.mu.Unlock()
 				*/
 			}
+			
 		}
 	}
 }
@@ -336,27 +324,35 @@ func (kv *ShardKV) getHandle(op *CommandRequest, index int) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	shardId := key2shard(op.Key)
-	shard := kv.kvStore[shardId]
 	response := CommandRequest{
 		ClientId: op.ClientId,
 		RequestId: op.RequestId,
 		Op: "Get",
 		Key: op.Key,
 	}
-	// 正常提服务
-	if shard.Status == Serving {
-		value, exists := kv.kvStore[shardId].KV[op.Key]
-		if !exists {
-			response.Err = ErrNoKey
-		} else {
-			response.Err = OK
-			response.Value = value
-		}
-	} else {
+	if kv.currentConfig.Shards[shardId] != kv.gid {
 		response.Err = ErrWrongGroup
+	} else {
+		// 正常提服务
+		if kv.kvStore[shardId].Status == Serving {
+			value, exists := kv.kvStore[shardId].KV[op.Key]
+			if !exists {
+				response.Err = ErrNoKey
+				log.Printf("Get nokey : %s", op.Key)
+			} else {
+				response.Err = OK
+				response.Value = value
+				//log.Printf("Get : %s", value)
+			}
+			kv.clientRequestId[op.ClientId] = op.RequestId
+		} else {
+			log.Print("Get shard no serving")
+			response.Err = ErrWrongGroup
+		}
 	}
-	if kv.chanExists(shardId, index) {
-		kv.getChan(shardId, index) <- response
+	
+	if kv.chanExists(index) {
+		kv.waitChans[index] <- response
 	}
 }
 
@@ -365,23 +361,28 @@ func (kv *ShardKV) appendHandle(op *CommandRequest, index int) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	shardId := key2shard(op.Key)
-	shard := kv.kvStore[shardId]
 	response := CommandRequest{
 		ClientId: op.ClientId,
 		RequestId: op.RequestId,
 		Op: "Append",
 		Key: op.Key,
 	}
-	// 正常提服务
-	if shard.Status == Serving {
-		kv.kvStore[shardId].KV[op.Key] += op.Value
-		response.Err = OK
-		log.Printf("putappend %s %s", op.Key, op.Value)
-	} else {
+	if kv.currentConfig.Shards[shardId] != kv.gid {
 		response.Err = ErrWrongGroup
+	} else {
+		// 正常提服务
+		if kv.kvStore[shardId].Status == Serving {
+			kv.kvStore[shardId].KV[op.Key] += op.Value
+			//log.Printf("Append : %s value = %s", op.Key, op.Value)
+			response.Err = OK
+			kv.clientRequestId[op.ClientId] = op.RequestId
+		} else {
+			log.Print("Append shard no serving")
+			response.Err = ErrWrongGroup
+		}
 	}
-	if kv.chanExists(shardId, index) {
-		kv.getChan(shardId, index) <- response
+	if kv.chanExists(index) {
+		kv.waitChans[index] <- response
 	}
 }
 
@@ -389,23 +390,29 @@ func (kv *ShardKV) putHandle(op *CommandRequest, index int) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	shardId := key2shard(op.Key)
-	shard := kv.kvStore[shardId]
+	
 	response := CommandRequest{
 		ClientId: op.ClientId,
 		RequestId: op.RequestId,
 		Op: "Put",
 		Key: op.Key,
 	}
-	// 正常提服务
-	if shard.Status == Serving {
-		kv.kvStore[shardId].KV[op.Key] = op.Value
-		response.Err = OK
-
-	} else {
+	if kv.currentConfig.Shards[shardId] != kv.gid {
 		response.Err = ErrWrongGroup
+	} else {
+		// 正常提服务
+		if kv.kvStore[shardId].Status == Serving {
+			kv.kvStore[shardId].KV[op.Key] = op.Value
+			//log.Printf("Put : %s value = %s", op.Key, op.Value)
+			response.Err = OK
+			kv.clientRequestId[op.ClientId] = op.RequestId
+		} else {
+			log.Print("Put shard no serving")
+			response.Err = ErrWrongGroup
+		}
 	}
-	if kv.chanExists(shardId, index) {
-		kv.getChan(shardId, index) <- response
+	if kv.chanExists(index) {
+		kv.waitChans[index] <- response
 	}
 }
 
@@ -422,19 +429,28 @@ func (kv *ShardKV) isDuplicate(shard int, clientId int64, requestId int64) bool 
 func (kv *ShardKV) updateConfigHandle(config *UpdateConfig) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+	if config.Config.Num <= kv.currentConfig.Num {
+		return
+	}
 	kv.lastConfig = kv.currentConfig
 	kv.currentConfig = config.Config
 	for shardId, gid := range config.Config.Shards {
 		if gid == kv.gid && kv.lastConfig.Shards[shardId] != gid {
-			kv.kvStore[shardId] = &Shard{
-				KV: make(map[string]string, 0),
-				Status: Pulling,
+			kv.kvStore[shardId] = new(Shard)
+			if config.Config.Num > 1 {
+				kv.kvStore[shardId].Status = Pulling
+				kv.pullingShard[shardId] = make(map[string]string)
+			} else {
+				kv.kvStore[shardId].Status = Serving
+				kv.kvStore[shardId].KV = make(map[string]string)
 			}
 		}
 	}
 	for shardId := range kv.kvStore {
 		if config.Config.Shards[shardId] != kv.gid {
 			kv.kvStore[shardId].Status = Erasing
+			kv.gcShard[shardId] = kv.kvStore[shardId].KV
+			kv.kvStore[shardId].KV = nil
 		}
 	}
 }
@@ -453,6 +469,7 @@ func (kv *ShardKV) pullShardHandle(data *PullShard) {
 			}
 		}
 		kv.kvStore[data.ShardId].Status = Serving
+		delete(kv.pullingShard, data.ShardId)
 	}
 }
 
@@ -461,17 +478,17 @@ func (kv *ShardKV) gcShardHandle(data *GCShard) {
 	defer kv.mu.Unlock()
 	if kv.kvStore[data.ShardId].Status == Erasing {
 		delete(kv.kvStore, data.ShardId)
+		delete(kv.gcShard, data.ShardId)
 	}
 }
 
-func (kv *ShardKV) chackConfigLoop() {
+func (kv *ShardKV) checkConfigLoop() {
 	for !kv.killed() {
 		_, isLeader := kv.rf.GetState()
 		// 分片都处于服务状态
 		if isLeader && kv.checkShardStatus() {
 			// 查询最新日志
 			ret := kv.shardctClerk.Query(kv.currentConfig.Num + 1)
-			log.Printf("get new config %d", ret.Num)
 			kv.mu.Lock()
 			if ret.Num == kv.currentConfig.Num + 1 {
 				command := Command {
@@ -484,7 +501,7 @@ func (kv *ShardKV) chackConfigLoop() {
 			}
 			kv.mu.Unlock()
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 	}
 }
 
@@ -496,12 +513,22 @@ func (kv *ShardKV) updateShardsLoop() {
 			time.Sleep(150 * time.Millisecond)
 			continue
 		}
+		shardIds := make([]int, 0)
 		kv.mu.Lock()
-		for shardId := range kv.kvStore {
-			if kv.kvStore[shardId].Status == Pulling {
-				gid := kv.lastConfig.Shards[shardId]
+		for shardId := range kv.pullingShard {
+			shardIds = append(shardIds, shardId)
+		}
+		kv.mu.Unlock()
+		var wg sync.WaitGroup
+		for _, shardId := range shardIds {
+			kv.mu.Lock()
+			gid := kv.lastConfig.Shards[shardId]
+			kv.mu.Unlock()
+			wg.Add(1)
+			go func(shardId int) {
+				defer wg.Done()
 				args := PullArgs {
-					Num: kv.lastConfig.Num,
+					Num: kv.currentConfig.Num,
 					Shard: shardId,
 				}
 				if servers, ok := kv.lastConfig.Groups[gid]; ok {
@@ -510,9 +537,11 @@ func (kv *ShardKV) updateShardsLoop() {
 					ok := srv.Call("ShardKV.Pull", &args, &reply)
 					if ok && (reply.Err == OK) {
 						requestIds := make(map[int64]int64, 0)
+						kv.mu.Lock()
 						for clientId, requestId := range kv.clientRequestId {
 							requestIds[clientId] = requestId
 						}
+						kv.mu.Unlock()
 						command := Command {
 							Op: InsertShards,
 							Data: PullShard{
@@ -522,17 +551,20 @@ func (kv *ShardKV) updateShardsLoop() {
 							},
 						}
 						_, _, is := kv.rf.Start(command)
+						
 						if !is {
-							break
+							return
 						}
 					}
 					if ok && (reply.Err == ErrWrongLeader) {
+						kv.mu.Lock()
 						kv.gid2Leader[gid] = (kv.gid2Leader[gid] + 1) % len(servers)
+						kv.mu.Unlock()
 					}
 				}
-			}
+			} (shardId)
 		}
-		kv.mu.Unlock()
+		wg.Wait()
 		time.Sleep(150 * time.Millisecond)
 	}
 }
@@ -560,17 +592,18 @@ func (kv *ShardKV) Pull(args *PullArgs, reply *PullReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	// 判断配置号是否满足
-	if kv.lastConfig.Num != args.Num {
+	if kv.currentConfig.Num != args.Num {
 		reply.Err = ErrConfig
 		return
 	}
 	// 检查分片是否满足
 	if kv.kvStore[args.Shard].Status != Erasing {
-		reply.Err = ErrConfig
+		reply.Err = "ErrShardStatus"
 		return
 	}
 	reply.Err = OK
-	for key, value := range kv.kvStore[args.Shard].KV {
+	reply.KV = make(map[string]string)
+	for key, value := range kv.gcShard[args.Shard] {
 		reply.KV[key] = value
 	}
 }
@@ -593,9 +626,18 @@ func (kv *ShardKV) gcShardsLoop() {
 			time.Sleep(150 * time.Millisecond)
 			continue
 		}
+		shardIds := make([]int, 0)
 		kv.mu.Lock()
-		for shardId := range kv.kvStore {
-			if kv.kvStore[shardId].Status == Erasing {
+		for shardId := range kv.gcShard {
+			shardIds = append(shardIds, shardId)
+		}
+		kv.mu.Unlock()
+		var wg sync.WaitGroup
+		
+		for shardId := range shardIds {
+			wg.Add(1)
+			go func(shardId int) {
+				defer wg.Done()
 				gid := kv.currentConfig.Shards[shardId]
 				args := CompleteArgs {
 					Num: kv.currentConfig.Num,
@@ -614,17 +656,17 @@ func (kv *ShardKV) gcShardsLoop() {
 						}
 						_, _, is := kv.rf.Start(command)
 						if !is {
-							break
+							return
 						}
 					}
 					if ok && (reply.Err == ErrWrongLeader) {
 						kv.gid2Leader[gid] = (kv.gid2Leader[gid] + 1) % len(servers)
 					}
 				}
-			}
+			}(shardId)
 		}
-		kv.mu.Unlock()
-		time.Sleep(150 * time.Millisecond)
+		wg.Wait()
+		time.Sleep(250 * time.Millisecond)
 	}
 }
 
@@ -680,6 +722,18 @@ func (kv *ShardKV) killed() bool {
 	return z == 1
 }
 
+func (kv *ShardKV) init() {
+	kv.lastConfig = shardctrler.Config{}
+	kv.currentConfig = kv.shardctClerk.Query(-1)
+	for shardId, gid := range kv.currentConfig.Shards {
+		if gid == kv.gid {
+			kv.kvStore[shardId] = new(Shard)
+			kv.kvStore[shardId].Status = Serving
+			kv.kvStore[shardId].KV = make(map[string]string)
+		}
+	}
+}
+
 //
 // servers[] contains the ports of the servers in this group.
 //
@@ -730,24 +784,24 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.persister = persister
 	kv.kvStore = make(map[int]*Shard)
 	kv.clientRequestId = make(map[int64]int64)
-	kv.waitChans = make(map[int]map[int]chan CommandRequest)
+	kv.waitChans = make(map[int]chan CommandRequest)
 	kv.dead = 0
 	kv.shardctClerk = shardctrler.MakeClerk(ctrlers)
-	kv.lastConfig = shardctrler.Config{
-		Num: -1,
-	}
-	kv.currentConfig = shardctrler.Config{
-		Num: -1,
-	}
+	
 	kv.lastApplied = 0
 	kv.gid2Leader = make(map[int]int)
+
+	kv.gcShard = make(map[int]map[string]string)
+	kv.pullingShard = make(map[int]map[string]string)
+
 	// Use something like this to talk to the shardctrler:
 	// kv.mck = shardctrler.MakeClerk(kv.ctrlers)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.init()
 	go kv.applyLoop()
-	go kv.chackConfigLoop()
+	go kv.checkConfigLoop()
 	go kv.updateShardsLoop()
 	go kv.gcShardsLoop()
 
