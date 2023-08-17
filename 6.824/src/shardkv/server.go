@@ -289,25 +289,26 @@ func (kv *ShardKV) applyLoop() {
 						}
 						continue
 					}
-					if kv.isDuplicate(shard, op.ClientId, op.RequestId) {
+					if kv.isDuplicate(op.ClientId, op.RequestId) {
 						continue
 					}
 					if op.Op == "Get" {
-						go kv.getHandle(&op, msg.CommandIndex)
+						kv.getHandle(&op, msg.CommandIndex)
 					} else if op.Op == "Append" {
-						go kv.appendHandle(&op, msg.CommandIndex)
+						kv.appendHandle(&op, msg.CommandIndex)
 					} else if op.Op == "Put" {
-						go kv.putHandle(&op, msg.CommandIndex)
+						kv.putHandle(&op, msg.CommandIndex)
 					}
 				} else if command.Op == Configuration {
 					config := command.Data.(UpdateConfig)
-					go kv.updateConfigHandle(&config)
+					//log.Printf("%d apply config %d", kv.gid, config.Config.Num)
+					kv.updateConfigHandle(&config)
 				} else if command.Op == InsertShards {
 					pullData := command.Data.(PullShard)
-					go kv.pullShardHandle(&pullData)
+					kv.pullShardHandle(&pullData)
 				} else if command.Op == DeleteShards {
 					gcShard := command.Data.(GCShard)
-					go kv.gcShardHandle(&gcShard)
+					kv.gcShardHandle(&gcShard)
 				}
 				/*
 				if _, isLeader := kv.rf.GetState(); isLeader {
@@ -363,7 +364,7 @@ func (kv *ShardKV) getHandle(op *CommandRequest, index int) {
 			}
 			kv.clientRequestId[op.ClientId] = op.RequestId
 		} else {
-			log.Print("Get shard no serving")
+			//log.Print("Get shard no serving")
 			response.Err = ErrWrongGroup
 		}
 	}
@@ -394,7 +395,7 @@ func (kv *ShardKV) appendHandle(op *CommandRequest, index int) {
 			response.Err = OK
 			kv.clientRequestId[op.ClientId] = op.RequestId
 		} else {
-			log.Print("Append shard no serving")
+			//log.Print("Append shard no serving")
 			response.Err = ErrWrongGroup
 		}
 	}
@@ -424,7 +425,7 @@ func (kv *ShardKV) putHandle(op *CommandRequest, index int) {
 			response.Err = OK
 			kv.clientRequestId[op.ClientId] = op.RequestId
 		} else {
-			log.Print("Put shard no serving")
+			//log.Print("Put shard no serving")
 			response.Err = ErrWrongGroup
 		}
 	}
@@ -433,7 +434,7 @@ func (kv *ShardKV) putHandle(op *CommandRequest, index int) {
 	}
 }
 
-func (kv *ShardKV) isDuplicate(shard int, clientId int64, requestId int64) bool {
+func (kv *ShardKV) isDuplicate(clientId int64, requestId int64) bool {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	seq, ex := kv.clientRequestId[clientId]
@@ -453,11 +454,12 @@ func (kv *ShardKV) showConfig(config shardctrler.Config) {
 func (kv *ShardKV) updateConfigHandle(config *UpdateConfig) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	if config.Config.Num <= kv.currentConfig.Num {
+	if config.Config.Num == kv.currentConfig.Num {
 		return
 	}
 	kv.lastConfig = kv.currentConfig
 	kv.currentConfig = config.Config
+	//log.Printf("%d update config %d", kv.gid, kv.currentConfig.Num)
 	for shardId, gid := range config.Config.Shards {
 		if gid == kv.gid && kv.lastConfig.Shards[shardId] != gid {
 			kv.store[shardId] = make(map[string]string)
@@ -467,6 +469,7 @@ func (kv *ShardKV) updateConfigHandle(config *UpdateConfig) {
 				//log.Printf("%d change Pulling %d", gid, shardId)
 			} else {
 				kv.status[shardId] = Serving
+				kv.lastConfig = shardctrler.Config{}
 			}
 		}
 	}
@@ -518,7 +521,7 @@ func (kv *ShardKV) checkConfigLoop() {
 			ret := kv.shardctClerk.Query(kv.currentConfig.Num + 1)
 			kv.mu.Lock()
 			if ret.Num == kv.currentConfig.Num + 1 {
-				//kv.showConfig(ret)
+				kv.showConfig(ret)
 				command := Command {
 					Op: Configuration,
 					Data: UpdateConfig {
@@ -529,7 +532,7 @@ func (kv *ShardKV) checkConfigLoop() {
 			}
 			kv.mu.Unlock()
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -538,7 +541,7 @@ func (kv *ShardKV) updateShardsLoop() {
 	for !kv.killed() {
 		_, isLeader := kv.rf.GetState()
 		if !isLeader {
-			time.Sleep(150 * time.Millisecond)
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 		shardIds := make([]int, 0)
@@ -553,25 +556,29 @@ func (kv *ShardKV) updateShardsLoop() {
 			gid := kv.lastConfig.Shards[shardId]
 			kv.mu.Unlock()
 			wg.Add(1)
-			//log.Printf("%d pulling %d", kv.gid, shardId)
+			log.Printf("%d pulling %d", kv.gid, shardId)
 			go func(shardId int) {
 				defer wg.Done()
+				kv.mu.Lock()
 				args := PullArgs {
 					Num: kv.currentConfig.Num,
 					Shard: shardId,
+					Gid: gid,
 				}
-				
 				if servers, ok := kv.lastConfig.Groups[gid]; ok {
 					srv := kv.make_end(servers[kv.gid2Leader[gid]])
+					kv.mu.Unlock()
 					var reply PullReply
 					ok := srv.Call("ShardKV.Pull", &args, &reply)
+					kv.mu.Lock()
+					if !ok {
+						log.Printf("%d Pull RPC fail!", kv.gid)
+					}
 					if ok && (reply.Err == OK) {
 						requestIds := make(map[int64]int64, 0)
-						kv.mu.Lock()
 						for clientId, requestId := range kv.clientRequestId {
 							requestIds[clientId] = requestId
 						}
-						kv.mu.Unlock()
 						command := Command {
 							Op: InsertShards,
 							Data: PullShard{
@@ -586,22 +593,22 @@ func (kv *ShardKV) updateShardsLoop() {
 							return
 						}
 					}
-					if ok && (reply.Err == ErrWrongLeader) {
-						kv.mu.Lock()
+					if !ok || (reply.Err == ErrWrongLeader) {
 						kv.gid2Leader[gid] = (kv.gid2Leader[gid] + 1) % len(servers)
-						kv.mu.Unlock()
 					}
 				}
+				kv.mu.Unlock()
 			} (shardId)
 		}
 		wg.Wait()
-		time.Sleep(150 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
 type PullArgs struct {
 	Num		int
 	Shard	int
+	Gid		int	
 }
 
 type PullReply struct {
@@ -621,14 +628,21 @@ func (kv *ShardKV) Pull(args *PullArgs, reply *PullReply) {
 	}
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+	if kv.gid != args.Gid {
+		reply.Err = ErrWrongGroup
+		log.Printf("%d get wrong gid %d pull", kv.gid, args.Gid)
+		return
+	}
 	// 判断配置号是否满足
 	if kv.currentConfig.Num != args.Num {
 		reply.Err = ErrConfig
+		log.Printf("%d Pull ErrConfig %d", kv.gid, kv.currentConfig.Num)
 		return
 	}
 	// 检查分片是否满足
 	if kv.status[args.Shard] != Erasing {
 		reply.Err = "ErrShardStatus"
+		log.Printf("%d Pull ErrShardStatus %d", kv.gid, kv.status[args.Shard])
 		return
 	}
 	reply.Err = OK
@@ -653,7 +667,7 @@ func (kv *ShardKV) gcShardsLoop() {
 	for !kv.killed() {
 		_, isLeader := kv.rf.GetState()
 		if !isLeader {
-			time.Sleep(150 * time.Millisecond)
+			time.Sleep(200 * time.Millisecond)
 			continue
 		}
 		shardIds := make([]int, 0)
@@ -665,19 +679,25 @@ func (kv *ShardKV) gcShardsLoop() {
 		var wg sync.WaitGroup
 		
 		for _, shardId := range shardIds {
-			//log.Printf("%d gcing %d", kv.gid, shardId)
+			log.Printf("%d gcing %d", kv.gid, shardId)
 			wg.Add(1)
 			go func(shardId int) {
 				defer wg.Done()
+				kv.mu.Lock()
 				gid := kv.currentConfig.Shards[shardId]
 				args := CompleteArgs {
 					Num: kv.currentConfig.Num,
 					Shard: shardId,
+					Gid: gid,
 				}
 				if servers, ok := kv.currentConfig.Groups[gid]; ok {
 					srv := kv.make_end(servers[kv.gid2Leader[gid]])
+					kv.mu.Unlock()
 					var reply CompleteReply
 					ok := srv.Call("ShardKV.CheckComplete", &args, &reply)
+					if !ok {
+						log.Printf("%d CheckComplete RPC fail!", kv.gid)
+					}
 					if ok && (reply.Err == OK) {
 						command := Command {
 							Op: DeleteShards,
@@ -690,20 +710,23 @@ func (kv *ShardKV) gcShardsLoop() {
 							return
 						}
 					}
-					if ok && (reply.Err == ErrWrongLeader) {
+					kv.mu.Lock()
+					if !ok || (reply.Err == ErrWrongLeader) {
 						kv.gid2Leader[gid] = (kv.gid2Leader[gid] + 1) % len(servers)
 					}
 				}
+				kv.mu.Unlock()
 			}(shardId)
 		}
 		wg.Wait()
-		time.Sleep(250 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
 type CompleteArgs struct{
 	Num		int
 	Shard	int
+	Gid		int
 }
 
 type CompleteReply struct {
@@ -722,9 +745,16 @@ func (kv *ShardKV) CheckComplete(args *CompleteArgs, reply *CompleteReply) {
 	}
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+	// 判断是否是该组
+	if kv.gid != args.Gid {
+		reply.Err = ErrWrongGroup
+		log.Printf("%d get wrong gid %d checkComplete", kv.gid, args.Gid)
+		return
+	}
 	// 判断配置号是否满足
 	if kv.currentConfig.Num < args.Num {
 		reply.Err = ErrConfig
+		log.Printf("%d checkComplete ErrConfig %d", kv.gid, kv.currentConfig.Num)
 		return
 	}
 	// 检查分片是否满足
@@ -732,6 +762,7 @@ func (kv *ShardKV) CheckComplete(args *CompleteArgs, reply *CompleteReply) {
 		reply.Err = OK
 	} else {
 		reply.Err = ErrConfig
+		log.Printf("%d checkComplete ErrShardStatus %d", kv.gid, kv.status[args.Shard])
 	}
 }
 
@@ -750,7 +781,10 @@ func (kv *ShardKV)kvServerSnapShot() []byte{
 		e.Encode(kv.pullingShard) != nil ||
 		e.Encode(kv.gcShard) != nil {
 			return nil
-		}
+	}
+	if _, isLeader := kv.rf.GetState(); isLeader {
+		log.Printf("%d do snapshot", kv.gid)
+	}
 	return w.Bytes()
 }
 
@@ -776,9 +810,12 @@ func (kv *ShardKV)readSnapShot(data []byte){
 		d.Decode(&lastConfig) != nil ||
 		d.Decode(&currentConfig) != nil ||
 		d.Decode(&pullingShard) != nil ||
-		d.Decode(gcShard) != nil {
+		d.Decode(&gcShard) != nil {
+			log.Printf("read snapshot fail!")
 			return 
-		}
+	}
+	kv.mu.Lock()
+	log.Printf("%d read snapshot OK", kv.gid)
 	kv.store = store
 	kv.status = status
 	kv.clientRequestId = clientRequestId
@@ -787,6 +824,7 @@ func (kv *ShardKV)readSnapShot(data []byte){
 	kv.currentConfig = currentConfig
 	kv.pullingShard = pullingShard
 	kv.gcShard = gcShard
+	kv.mu.Unlock()
 }
 
 
@@ -822,13 +860,9 @@ func (kv *ShardKV) killed() bool {
 }
 
 func (kv *ShardKV) init() {
-	kv.lastConfig = shardctrler.Config{}
-	kv.currentConfig = kv.shardctClerk.Query(-1)
-	for shardId, gid := range kv.currentConfig.Shards {
-		if gid == kv.gid {
-			kv.status[shardId] = Serving
-			kv.store[shardId] = make(map[string]string)
-		}
+	
+	for gid := range kv.currentConfig.Groups {
+		kv.gid2Leader[gid] = 0
 	}
 }
 
@@ -898,11 +932,16 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.lastConfig = shardctrler.Config{}
+	kv.currentConfig = shardctrler.Config{}
 	kv.init()
 	snapshot := persister.ReadSnapshot()
 	if len(snapshot) > 0 {
 		kv.readSnapShot(snapshot)
+	} else {
+		log.Printf("snapshot is empty!")
 	}
+	log.Printf("%d start server!", kv.gid)
 	go kv.applyLoop()
 	go kv.checkConfigLoop()
 	go kv.updateShardsLoop()
