@@ -196,7 +196,7 @@ func (rf *Raft) realToAll(index int) (int) {
 	return index + rf.lastIncludedIndex + 1;
 }
 
-func (rf *Raft) raftstate() ([]byte) {
+func (rf *Raft) Raftstate() ([]byte) {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
@@ -216,7 +216,7 @@ func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
 	
-	rf.persister.SaveRaftState(rf.raftstate())
+	rf.persister.SaveRaftState(rf.Raftstate())
 }
 
 
@@ -279,7 +279,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	if index > rf.lastApplied{
 		rf.lastApplied = index
 	}
-	rf.persister.SaveStateAndSnapshot(rf.raftstate(), snapshot)
+	rf.persister.SaveStateAndSnapshot(rf.Raftstate(), snapshot)
 }
 
 
@@ -336,7 +336,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.lastApplied = args.LastIncludedIndex
 	}
 
-	rf.persister.SaveStateAndSnapshot(rf.raftstate(), args.Data)
+	rf.persister.SaveStateAndSnapshot(rf.Raftstate(), args.Data)
 
 
 	msg := ApplyMsg{

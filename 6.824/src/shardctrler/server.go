@@ -360,7 +360,12 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	if args.RequestId <= sc.applyIndexs[args.ClientId] {
 		reply.Err = OK
 		reply.WrongLeader = false
-		reply.Config = sc.configs[args.Num]
+		if args.Num < 0 || args.Num >= len(sc.configs) {
+			reply.Config = sc.configs[len(sc.configs) - 1]
+			//log.Printf(":server %d reply config %d", sc.me, len(sc.configs) - 1)
+		} else {
+			reply.Config = sc.configs[args.Num]
+		}
 		sc.mu.Unlock()
 		return
 	}
